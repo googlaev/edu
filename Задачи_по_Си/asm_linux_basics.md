@@ -1072,3 +1072,41 @@ rax   Имя        rdi          rsi        rdx
 *Архитектура: x86-64 Linux. Ассемблер: NASM. Для изучения ARM/AArch64
 синтаксис и инструкции будут другими, но принципы работы со стеком,
 регистрами и системными вызовами — те же.*
+
+
+
+section .data
+    num1 db 5
+    num2 db 3
+    result db 0
+    newline db 10
+
+section .bss
+    output resb 2      ; место под строковое представление результата
+
+section .text
+    global _start
+
+_start:
+    ; Сложение
+    mov al, [num1]
+    add al, [num2]
+    mov [result], al
+
+    ; Преобразование числа в ASCII
+    mov al, [result]
+    add al, '0'        ; перевод в символ цифры
+    mov [output], al
+    mov byte [output+1], 10   ; перевод строки
+
+    ; Вывод результата
+    mov eax, 4         ; sys_write
+    mov ebx, 1         ; stdout
+    mov ecx, output    ; адрес строки
+    mov edx, 2         ; длина (цифра + \n)
+    int 0x80
+
+    ; Выход
+    mov eax, 1         ; sys_exit
+    xor ebx, ebx
+    int 0x80
