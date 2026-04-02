@@ -1110,3 +1110,43 @@ _start:
     mov eax, 1         ; sys_exit
     xor ebx, ebx
     int 0x80
+
+
+
+
+
+section .data
+    num1 db 5
+    num2 db 3
+    result db 0      ; ← объявление result
+    newline db 10
+
+section .bss
+    output resb 2    ; ← объявление output (2 байта)
+
+section .text
+    global _start
+
+_start:
+    ; Сложение
+    mov al, [num1]
+    add al, [num2]
+    mov [result], al
+
+    ; Преобразование в ASCII
+    mov al, [result]
+    add al, '0'
+    mov [output], al
+    mov byte [output+1], 10
+
+    ; Вывод
+    mov eax, 4
+    mov ebx, 1
+    mov ecx, output
+    mov edx, 2
+    int 0x80
+
+    ; Выход
+    mov eax, 1
+    xor ebx, ebx
+    int 0x80
