@@ -1,0 +1,282 @@
+# Многопоточный анализ текстового файла
+
+> Задача среднего уровня — Python / Java / C++  
+> Темы: многопоточность, синхронизация, файловый ввод-вывод
+
+---
+
+## Описание
+
+Дан большой текстовый файл (от 100 МБ) с произвольным текстом.  
+Нужно **параллельно** обработать файл несколькими потоками, чтобы собрать статистику — подсчитать частоту каждого уникального слова.  
+В конце объединить результаты всех потоков и записать итоговый файл, отсортированный по убыванию частоты.
+
+---
+
+## Требования
+
+1. **Чтение чанками** — каждый поток получает свой диапазон строк (или байт). Делить файл без разрезания слов посередине.
+2. **Локальный словарь** — каждый поток строит свой `слово → количество` для своего куска.
+3. **Thread-safe слияние** — объединение результатов потоков защищено мьютексом или используется атомарная структура данных.
+4. **Нормализация** — слова привести к нижнему регистру, убрать знаки пунктуации.
+5. **Запись результата** — итоговый файл `result.txt` в формате `слово: N`, отсортированный по убыванию частоты.
+6. **Параметр потоков** — число потоков задаётся аргументом (по умолчанию = количеству ядер CPU).
+
+---
+
+## Входные данные
+
+- Файл `input.txt` — произвольный текст, размер от 100 МБ
+- Аргумент командной строки: `--threads N` (необязательно)
+
+## Выходные данные
+
+Файл `result.txt`:
+
+```
+the: 15423
+and: 12987
+to: 11200
+...
+```
+
+---
+
+## Подсказки по реализации
+
+| Элемент | Python | Java | C++ |
+|---|---|---|---|
+| Пул потоков | `ThreadPoolExecutor` | `ExecutorService` | `std::thread` |
+| Синхронизация | `threading.Lock` | `ReentrantLock` | `std::mutex` |
+| Словарь | `collections.Counter` | `ConcurrentHashMap` | `std::unordered_map` |
+| Очередь задач | `queue.Queue` | `LinkedBlockingQueue` | `std::queue` + mutex |
+
+---
+
+## Варианты сложности
+
+### Базовый
+
+Разделить файл на равные куски по строкам. Каждый поток читает свой кусок, строит Counter. Главный поток объединяет через Lock.
+
+```python
+import threading
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+import re, os
+
+def process_chunk(lines):
+    counter = Counter()
+    for line in lines:
+        words = re.findall(r"[a-zа-яё]+", line.lower())
+        counter.update(words)
+    return counter
+
+def analyze(filepath, num_threads=os.cpu_count()):
+    with open(filepath, encoding="utf-8") as f:
+        all_lines = f.readlines()
+
+    chunk_size = len(all_lines) // num_threads
+    chunks = [all_lines[i*chunk_size:(i+1)*chunk_size] for i in range(num_threads)]
+    chunks[-1] += all_lines[num_threads * chunk_size:]  # остаток
+
+    total = Counter()
+    lock = threading.Lock()
+
+    def worker(chunk):
+        result = process_chunk(chunk)
+        with lock:
+            total.update(result)
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        executor.map(worker, chunks)
+
+    with open("result.txt", "w", encoding="utf-8") as out:
+        for word, count in total.most_common():
+            out.write(f"{word}: {count}\n")
+
+analyze("input.txt")
+```
+
+---
+
+### Продвинутый — Producer/Consumer
+
+Producer читает файл и кладёт чанки в `Queue`.  
+Consumer-потоки забирают чанки, обрабатывают, сохраняют локальные словари.  
+После завершения — слияние всех локальных словарей.
+
+```python
+import threading, queue, re, os
+from collections import Counter
+
+SENTINEL = None
+
+def producer(filepath, q, chunk_size=1000):
+    with open(filepath, encoding="utf-8") as f:
+        chunk = []
+        for line in f:
+            chunk.append(line)
+            if len(chunk) >= chunk_size:
+                q.put(chunk)
+                chunk = []
+        if chunk:
+            q.put(chunk)
+    # отправляем sentinel для каждого consumer
+    for _ in range(os.cpu_count()):
+        q.put(SENTINEL)
+
+def consumer(q, results, lock):
+    local = Counter()
+    while True:
+        chunk = q.get()
+        if chunk is SENTINEL:
+            break
+        for line in chunk:
+            local.update(re.findall(r"[a-zа-яё]+", line.lower()))
+    with lock:
+        results.update(local)
+
+def analyze(filepath, num_threads=os.cpu_count()):
+    q = queue.Queue(maxsize=50)
+    results = Counter()
+    lock = threading.Lock()
+
+    prod = threading.Thread(target=producer, args=(filepath, q, 1000))
+    consumers = [threading.Thread(target=consumer, args=(q, results, lock))
+                 for _ in range(num_threads)]
+
+    prod.start()
+    for c in consumers: c.start()
+    prod.join()
+    for c in consumers: c.join()
+
+    with open("result.txt", "w", encoding="utf-8") as out:
+        for word, count in results.most_common():
+            out.write(f"{word}: {count}\n")
+```
+
+---
+
+### С mmap (memory-mapped IO)
+
+Файл отображается в память. Каждый поток получает срез байт, сдвигая границы до ближайшего пробела/переноса строки.
+
+```python
+import mmap, threading, re, os
+from collections import Counter
+
+def find_boundary(mm, pos):
+    """Сдвинуть позицию вправо до конца слова."""
+    while pos < len(mm) and mm[pos:pos+1] not in (b' ', b'\n'):
+        pos += 1
+    return pos
+
+def process_segment(mm, start, end):
+    segment = mm[start:end].decode("utf-8", errors="ignore")
+    return Counter(re.findall(r"[a-zа-яё]+", segment.lower()))
+
+def analyze(filepath, num_threads=os.cpu_count()):
+    total = Counter()
+    lock = threading.Lock()
+
+    with open(filepath, "rb") as f:
+        mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        size = len(mm)
+        approx = size // num_threads
+        boundaries = [0]
+        for i in range(1, num_threads):
+            boundaries.append(find_boundary(mm, i * approx))
+        boundaries.append(size)
+
+        def worker(start, end):
+            result = process_segment(mm, start, end)
+            with lock:
+                total.update(result)
+
+        threads = [threading.Thread(target=worker,
+                                    args=(boundaries[i], boundaries[i+1]))
+                   for i in range(num_threads)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        mm.close()
+
+    with open("result.txt", "w", encoding="utf-8") as out:
+        for word, count in total.most_common():
+            out.write(f"{word}: {count}\n")
+```
+
+---
+
+### Расширенный — несколько файлов + прогресс-бар
+
+- Принять на вход **папку** с `.txt` файлами
+- Обрабатывать файлы параллельно (один файл — один поток или пул)
+- Вести общий словарь частот по всем файлам
+- Отображать прогресс в консоли: `[====>   ] 4/7 файлов`
+
+```python
+import threading, re, os
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+def process_file(filepath):
+    counter = Counter()
+    with open(filepath, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            counter.update(re.findall(r"[a-zа-яё]+", line.lower()))
+    return counter
+
+def analyze_directory(dirpath, num_threads=os.cpu_count()):
+    files = [os.path.join(dirpath, f)
+             for f in os.listdir(dirpath) if f.endswith(".txt")]
+    total = Counter()
+    lock = threading.Lock()
+    done = 0
+
+    def print_progress(current, total_count):
+        width = 30
+        filled = int(width * current / total_count)
+        bar = "=" * filled + ">" + " " * (width - filled - 1)
+        print(f"\r[{bar}] {current}/{total_count}", end="", flush=True)
+
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = {executor.submit(process_file, f): f for f in files}
+        for future in as_completed(futures):
+            result = future.result()
+            with lock:
+                total.update(result)
+                done += 1
+                print_progress(done, len(files))
+
+    print()  # новая строка после прогресс-бара
+
+    with open("result.txt", "w", encoding="utf-8") as out:
+        for word, count in total.most_common():
+            out.write(f"{word}: {count}\n")
+
+analyze_directory("./texts/")
+```
+
+---
+
+## Типичные ошибки
+
+- **Race condition** — два потока одновременно обновляют общий словарь без блокировки → данные теряются или портятся
+- **Разрезание слов** — делить файл по байтам без поиска границы слова → первое/последнее слово чанка обрезается
+- **GIL в Python** — для CPU-bound задач `threading` в Python ограничен GIL; для настоящего параллелизма используйте `multiprocessing`
+- **Deadlock** — если Lock захватывается в неправильном порядке при нескольких блокировках
+
+---
+
+## Критерии приёмки
+
+- [ ] Программа корректно считает слова на большом файле (>100 МБ)
+- [ ] Результат идентичен однопоточной версии
+- [ ] Нет race condition (проверить с `--threads 8`)
+- [ ] Параметр `--threads` работает корректно
+- [ ] Файл `result.txt` отсортирован по убыванию
+
+---
+
+*Задача составлена для практики: threading, Lock, Queue, mmap, Counter*
